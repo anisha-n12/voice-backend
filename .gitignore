@@ -1,3 +1,7 @@
 node_modules
 .env
 .vercel
+*.mp3
+*.wav
+*.m4a
+*.webm
