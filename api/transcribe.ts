@@ -1,3 +1,4 @@
+
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 import formidable from "formidable";
 import fs from "fs/promises";
@@ -13,22 +14,27 @@ export default async function handler(
   res: VercelResponse
 ) {
   if (req.method !== "POST") {
-    return res.status(405).json({
-      error: "Method not allowed",
+    res.setHeader("Allow", "POST");
+    return res.status(405).json({ error: "Method not allowed" });
+  }
+
+  const apiKey = process.env.SARVAM_API_KEY;
+
+  if (!apiKey) {
+    console.error("SARVAM_API_KEY is not configured");
+    return res.status(500).json({
+      error: "Sarvam API is not configured",
     });
   }
 
-  if (!process.env.SARVAM_API_KEY) {
-    return res.status(500).json({
-      error: "SARVAM_API_KEY is not configured",
-    });
-  }
+  let uploadedFilePath: string | undefined;
 
   try {
-    // Parse uploaded audio
     const form = formidable({
-      maxFileSize: 10 * 1024 * 1024, // 10 MB
+      maxFileSize: 10 * 1024 * 1024,
+      maxFiles: 1,
       keepExtensions: true,
+      allowEmptyFiles: false,
     });
 
     const [, files] = await form.parse(req);
@@ -39,17 +45,26 @@ export default async function handler(
 
     if (!uploadedFile) {
       return res.status(400).json({
-        error: "No audio file received. Use field name 'file'.",
+        error: "No audio file received. Use multipart field name 'file'.",
       });
     }
 
-    // Read audio file
+    uploadedFilePath = uploadedFile.filepath;
+
+    if (uploadedFile.size === 0) {
+      return res.status(400).json({
+        error: "The uploaded audio file is empty",
+      });
+    }
+
     const audioBuffer = await fs.readFile(uploadedFile.filepath);
 
-    // Create multipart request for Sarvam
     const sarvamForm = new FormData();
 
-    const audioBlob = new Blob([audioBuffer], {
+    // Convert Node Buffer to a Blob-compatible byte array.
+    const audioBytes = new Uint8Array(audioBuffer);
+
+    const audioBlob = new Blob([audioBytes], {
       type: uploadedFile.mimetype || "audio/wav",
     });
 
@@ -63,41 +78,68 @@ export default async function handler(
     sarvamForm.append("mode", "transcribe");
     sarvamForm.append("language_code", "unknown");
 
-    // Send audio to Sarvam
     const sarvamResponse = await fetch(
       "https://api.sarvam.ai/speech-to-text",
       {
         method: "POST",
         headers: {
-          "api-subscription-key": process.env.SARVAM_API_KEY,
+          "api-subscription-key": apiKey,
         },
         body: sarvamForm,
       }
     );
 
+    if (!sarvamResponse.ok) {
+      const details = await sarvamResponse.text();
+
+      console.error(
+        "Sarvam request failed:",
+        sarvamResponse.status,
+        details
+      );
+
+      return res.status(502).json({
+        error: "Sarvam transcription failed",
+        upstreamStatus: sarvamResponse.status,
+      });
+    }
+
     const sarvamData = await sarvamResponse.json();
 
-    if (!sarvamResponse.ok) {
-      console.error("Sarvam error:", sarvamData);
+    const transcript =
+      typeof sarvamData.transcript === "string"
+        ? sarvamData.transcript.trim()
+        : "";
 
-      return res.status(sarvamResponse.status).json({
-        error: "Sarvam transcription failed",
-        details: sarvamData,
+    if (!transcript) {
+      return res.status(422).json({
+        error: "No speech detected. Please try speaking again.",
+        language_code: sarvamData.language_code ?? null,
+        request_id: sarvamData.request_id ?? null,
       });
     }
 
     return res.status(200).json({
-      transcript: sarvamData.transcript,
-      language_code: sarvamData.language_code,
-      request_id: sarvamData.request_id,
+      transcript,
+      language_code: sarvamData.language_code ?? null,
+      request_id: sarvamData.request_id ?? null,
     });
-
   } catch (error) {
     console.error("Transcription error:", error);
 
     return res.status(500).json({
-      error: "Internal server error",
-      details: error instanceof Error ? error.message : String(error),
+      error: "Internal server error during transcription",
     });
+  } finally {
+    if (uploadedFilePath) {
+      try {
+        await fs.unlink(uploadedFilePath);
+      } catch (cleanupError) {
+        console.error(
+          "Temporary audio cleanup failed:",
+          cleanupError
+        );
+      }
+    }
   }
 }
